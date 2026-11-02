@@ -1,6 +1,7 @@
 """Interactive market-making trainer with mid-round RE-QUOTING and inventory.
 
-Run:  python mm_play.py        (standard library only; matplotlib optional)
+Run:  python mm_play.py        (needs numpy + scipy for the end-of-session bots;
+                                 matplotlib optional)
 
 You post a two-way market. Orders arrive one at a time. Between arrivals you
 HOLD (press Enter) or RE-QUOTE (type a new bid and ask). Two skills this trains
@@ -13,13 +14,14 @@ that a static quote can't:
      to the true value. Skew your quote (drop both sides when long, lift both
      when short) to flatten before a wrong-way position burns you.
 
-The engine lives in mm_engine.py -- import it into a notebook to run thousands
-of sessions, or wrap a different UI (Streamlit, web) around it later.
+The engine lives in mm_engine.py. Every round's order flow is drawn up front, so
+at the end the bots in mm_sim.py replay the exact rounds you played and you are
+graded against them on identical order flow.
 """
 
 import random
 from dataclasses import replace
-import MM_Engine as mm
+import mm_engine as mm
 
 
 def parse_quote(raw):
@@ -68,14 +70,27 @@ def choose_drift(cfg):
         if pick == "1":
             return replace(cfg, sigma_step=0.0)
         if pick == "2":
-            return replace(cfg, sigma_step=2.0)
+            return replace(cfg, sigma_step=mm.DRIFT_STEP)
         print("Enter 1 or 2.")
+
+
+def choose_rounds(cfg):
+    print(f"\nHow many rounds? Enter for {cfg.rounds}. More rounds = a sharper verdict"
+          f" at the end;\none round's P&L is noisy enough that 10 rounds rarely settle it.")
+    while True:
+        pick = input("> ").strip()
+        if pick == "":
+            return cfg
+        if pick.isdigit() and int(pick) > 0:
+            return replace(cfg, rounds=int(pick))
+        print("Enter a positive whole number, or just Enter.")
 
 
 def play_round(cfg, r, rng):
     """Play one round. Returns (status, record) where status is
     'done' | 'skip' | 'quit'. record is None unless status == 'done'."""
-    V = mm.draw_value(cfg, rng)
+    scenario = mm.draw_round(cfg, rng)
+    V = scenario.values[0]
     N = cfg.arrivals
     cash = 0.0
     inv = 0
@@ -113,7 +128,8 @@ def play_round(cfg, r, rng):
                 skews.append(abs((bid + ask) / 2 - cfg.fair))
 
         mid = (bid + ask) / 2
-        action, price, size = mm.one_arrival(bid, ask, V, cfg, rng)
+        V = scenario.values[k - 1]
+        action, price, size = mm.resolve(scenario.orders[k - 1], V, bid, ask, cfg)
         s, a = mm.fill_pnl(action, price, size, mid, V)
         spread_tot += s
         adverse_tot += a
@@ -134,9 +150,9 @@ def play_round(cfg, r, rng):
         else:
             print(f"    -> no trade")
         max_abs_inv = max(max_abs_inv, abs(inv))
-        V = mm.step_value(V, cfg, rng)  # value moves before the next order
 
     # Mark remaining inventory to the closing value.
+    V = scenario.values[-1]
     carried = inv
     cash += inv * V
     round_pnl = cash
@@ -157,7 +173,24 @@ def play_round(cfg, r, rng):
         pnl=round_pnl, spread=spread_tot, adverse=adverse_tot, drift=drift,
         fills=fills, volume=volume, avg_width=sum(widths) / len(widths),
         avg_skew=sum(skews) / len(skews),
-        max_abs_inv=max_abs_inv, carried=abs(carried)))
+        max_abs_inv=max_abs_inv, carried=abs(carried), scenario=scenario))
+
+
+def benchmarks(cfg, scenarios, rng):
+    """Replay the player's rounds with two bots, and estimate their long-run
+    averages on fresh rounds. The static width is tuned on a separate batch so
+    the benchmark isn't flattered by picking the luckiest width."""
+    import mm_sim as ms
+    seed = rng.randrange(2**31)
+    train = ms.draw_batch(cfg, 3000, seed)
+    fresh = ms.draw_batch(cfg, 2000, seed + 1)
+    (h,), _ = ms.tune(ms.Static, ms.HALF_SPREADS, cfg, train)
+    yours = ms.from_scenarios(scenarios)
+    out = {"static_h": h}
+    for key, make in [("static", lambda: ms.Static(h)), ("bayes", ms.BayesMyopic)]:
+        out[key] = dict(yours=ms.simulate(make(), yours, cfg)["pnl"],
+                        long_run=ms.simulate(make(), fresh, cfg)["pnl"].mean())
+    return out
 
 
 def summarize(hist, cfg, rng):
@@ -178,7 +211,8 @@ def summarize(hist, cfg, rng):
     avg_maxinv = sum(h["max_abs_inv"] for h in played) / n
     avg_carried = sum(h["carried"] for h in played) / n
 
-    best_h, static_pnl = mm.best_static_half_spread(cfg, rng)
+    print("\n  replaying your rounds against the bots ...", flush=True)
+    bench = benchmarks(cfg, [h["scenario"] for h in played], rng)
 
     print("\n" + "=" * 60)
     print(f"SESSION SUMMARY  ({n} rounds)")
@@ -198,27 +232,45 @@ def summarize(hist, cfg, rng):
     print(f"  Avg peak inventory / round .. {avg_maxinv:.1f}")
     print(f"  Avg carried to close ........ {avg_carried:.1f}")
 
-    print(f"\n  Benchmark: best NON-updating symmetric width for these settings")
-    print(f"  is ~{2 * best_h:.0f} (half-spread {best_h:.1f}), worth "
-          f"~{static_pnl:+.2f} / round.")
-    print(f"  You made {pnl / n:+.2f} / round.")
+    you = [h["pnl"] for h in played]
+    print(f"\n  Same rounds, same order flow -- what the bots made per round:")
+    print(f"    you ......................... {pnl / n:+.2f}")
+    for label, key in [("static, best fixed quote ", "static"),
+                       ("Bayesian posterior quoter ", "bayes")]:
+        print(f"    {label:.<29} {bench[key]['yours'].mean():+.2f}"
+              f"   (long-run average {bench[key]['long_run']:+.2f})")
+    if bench["static_h"] >= 30:
+        print("    (no fixed quote makes money here, so static's best is to quote so wide"
+              " it\n     never trades; the Bayesian bot has no tuned parameters)")
+    else:
+        print(f"    (static quotes fair ± {bench['static_h']:.1f}; the Bayesian bot has no"
+              f" tuned parameters)")
 
     print("\n  Read:")
-    edge = pnl / n - static_pnl
-    if edge > 0.15 * abs(static_pnl) + 0.5:
-        print("  - You beat the no-update benchmark. You're pulling information")
-        print("    out of order flow -- marking toward V as it reveals itself.")
-    elif edge < -0.15 * abs(static_pnl) - 0.5:
-        print("  - You're below the naive static benchmark. Either you're not")
-        print("    re-quoting on flow, or you're over-reacting and paying for it")
-        print("    in wrong-way inventory. Update, but don't chase every fill.")
-    else:
-        print("  - You're roughly at the no-update benchmark. Re-quoting isn't")
-        print("    helping yet -- watch which side keeps trading and mark that way.")
+    for label, key in [("the static quote", "static"), ("the Bayesian bot", "bayes")]:
+        gap = [y - b for y, b in zip(you, bench[key]["yours"])]
+        mean = sum(gap) / n
+        if n < 2:
+            print(f"  - One round can't separate you from {label}; play more.")
+            continue
+        sd = (sum((g - mean) ** 2 for g in gap) / (n - 1)) ** 0.5
+        half = 1.96 * sd / n ** 0.5
+        if mean - half > 0:
+            print(f"  - You beat {label} by {mean:+.1f} ± {half:.1f} / round (95%).")
+        elif mean + half < 0:
+            print(f"  - You trail {label} by {mean:+.1f} ± {half:.1f} / round (95%).")
+        else:
+            need = (1.96 * sd / abs(mean)) ** 2 if mean else float("inf")
+            more = f"roughly {need:,.0f} rounds" if need < 1e5 else "a very long session"
+            print(f"  - Against {label}: {mean:+.1f} ± {half:.1f} / round -- too few rounds")
+            print(f"    to tell. If a gap that size is real, confirming it takes {more}.")
 
     if fills and spread > 0 and adverse < -0.6 * spread:
         print("  - Adverse selection is eating most of your spread. You're getting")
         print("    picked off -- widen, or mark your mid faster when flow is one-sided.")
+        if cfg.max_size > 1:
+            print("    A big fill is more likely informed: after you get hit in size,")
+            print("    mark harder than you would for a single lot.")
     if avg_maxinv >= 1.2 * cfg.max_size:
         print("  - Inventory ran large. A single big fill can load you fast now.")
         print("    When you're long, drop BOTH quotes to invite sellers and deter")
@@ -227,10 +279,6 @@ def summarize(hist, cfg, rng):
     if avg_skew > cfg.sigma_v:
         print("  - Big average skew. Skewing to manage inventory is good; skewing")
         print("    beyond what flow justifies is just a directional bet.")
-    if fills and spread > 0 and adverse < -0.55 * spread:
-        print("  - A big fill is more likely informed. After you get hit in size,")
-        print("    treat it as a stronger signal you're mispriced -- mark harder and")
-        print("    consider widening, not just flattening the position.")
     if cfg.sigma_step > 0 and drift < -0.4 * abs(spread) - 1:
         print("  - Drift is costing you: value moved against inventory you were")
         print("    holding. When V can walk, carry less -- flatten faster and don't")
@@ -260,6 +308,7 @@ def main():
     rng = random.Random()
     cfg = choose_config()
     cfg = choose_drift(cfg)
+    cfg = choose_rounds(cfg)
     drift_note = (f"V drifts ~{cfg.sigma_step:.1f} per order, so inventory carries timing risk."
                   if cfg.sigma_step > 0 else
                   "V is fixed for the round; your only value risk is mis-estimating it.")
